@@ -1,7 +1,7 @@
 fn main() {
-    let file_name = "my_resume.pdf";
-    let file_size = 2500000;
+    let data: Vec<u8> = vec![72, 101, 108, 108, 111];
 
-    println!("Preparing to send: {}", file_name);
-    println!("File size: {} bytes", file_size);
+    println!("Data: {:?}", data);
+    println!("Size: {} bytes", data.len());
+    println!("Fisrt Byte: {}" , data[0]);
 }
