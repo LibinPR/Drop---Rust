@@ -1,38 +1,71 @@
-use std::io::Read;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::fs;
+use std::thread;
+
+use drop::protocol::receive_header;
 
 fn main() {
-  let listener = TcpListener::bind("127.0.0.1:9000").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:9000").unwrap();
 
-  println!("Server is listening on 127.0.0.1:9000");
+    println!("Server is listening on 127.0.0.1:9000");
 
-  for stream in listener.incoming() {
-    let mut stream = stream.unwrap();
+    for stream in listener.incoming() {
+        let stream = stream.unwrap();
 
-    //reading file size
-    let mut size_buffer = [0u8;8];
-    stream.read_exact(&mut size_buffer).unwrap();
-    let file_size = u64::from_be_bytes(size_buffer);
+        thread::spawn(|| {
+            handle_client(stream);
+        });
+    }
+}
 
-    println!("Incoming file: {} bytes", file_size);
+fn handle_client(mut stream: std::net::TcpStream) {
+    // Receive the transfer header.
+    let header = receive_header(&mut stream).unwrap();
 
-    //receive the file
-    let mut file_data = Vec::new();
+    println!("Transfer ID: {}", header.transfer_id);
+    println!("Filename: {}", header.filename);
+    println!("File size: {} bytes", header.file_size);
+
+    // Create a unique destination filename.
+    let path = format!(
+        "received/{}_{}",
+        header.transfer_id,
+        header.filename
+    );
+
+    let mut file = File::create(&path).unwrap();
+
+    // Receive the file in chunks.
     let mut buffer = [0u8; 1024];
 
-    while file_data.len() < file_size as usize {
-      let bytes_read = stream.read(&mut buffer).unwrap();
+    let mut received = 0u64;
 
-      if bytes_read == 0{
-        break;
-      }
+    while received < header.file_size {
+        let bytes_read = stream.read(&mut buffer).unwrap();
 
-      file_data.extend_from_slice(&buffer[..bytes_read]);
-     }
+        if bytes_read == 0 {
+            break;
+        }
 
-    println!("Received {} bytes", file_data.len());
-    fs::write("received.txt" , &file_data).unwrap();
-    println!("File saves as received.txt");
-  }
+        file.write_all(&buffer[..bytes_read]).unwrap();
+
+        received += bytes_read as u64;
+
+        println!(
+            "Received {} / {} bytes",
+            received,
+            header.file_size
+        );
+    }
+
+    if received == header.file_size {
+        println!("File saved as {}", path);
+    } else {
+        println!(
+            "Transfer incomplete: received {} / {} bytes",
+            received,
+            header.file_size
+        );
+    }
 }
