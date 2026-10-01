@@ -31,16 +31,27 @@ fn main() {
                 let message =
                     String::from_utf8_lossy(&buffer[..bytes_received]);
 
-                let parts: Vec<&str> = message.split('|').collect();
+                let parts: Vec<&str> =
+                    message.split('|').collect();
 
-                if parts.len() == 3 && parts[0] == "DROP_HERE" {
-                    let device_name = parts[1];
-                    let transfer_port = parts[2];
+                if parts.len() == 4
+                    && parts[0] == "DROP_HERE"
+                {
+                    let device_id = parts[1];
+                    let device_name = parts[2];
+                    let transfer_port = parts[3];
 
                     println!("Found Drop device:");
                     println!("  Name: {}", device_name);
-                    println!("  IP: {}", sender_address.ip());
-                    println!("  Port: {}", transfer_port);
+                    println!("  ID: {}", device_id);
+                    println!(
+                        "  IP: {}",
+                        sender_address.ip()
+                    );
+                    println!(
+                        "  Port: {}",
+                        transfer_port
+                    );
                     println!();
                 }
             }

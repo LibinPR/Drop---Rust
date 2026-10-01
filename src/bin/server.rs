@@ -5,16 +5,33 @@ use std::net::TcpListener;
 use std::thread;
 
 use drop::discovery;
+use drop::pairing;
 use drop::protocol::receive_header;
 
 fn main() {
-    // Start UDP device discovery in its own thread.
-    thread::spawn(|| {
-        discovery::run_server();
+    // Create this device's identity.
+    let identity = discovery::load_or_create_device_identity();
+
+    // Generate a pairing code.
+    let pairing_code = pairing::generate_pairing_code();
+
+    // Start the pairing server.
+    thread::spawn(move || {
+        pairing::run_server(pairing_code);
     });
 
-    // Start the TCP file-transfer server.
-    let listener = TcpListener::bind("0.0.0.0:9000").unwrap();
+    println!("Starting Drop...");
+    println!("Device name: {}", identity.device_name);
+    println!("Device ID: {}", identity.device_id);
+
+    // Start UDP discovery.
+    thread::spawn(move || {
+        discovery::run_server(identity);
+    });
+
+    // Start TCP file transfer server.
+    let listener =
+        TcpListener::bind("0.0.0.0:9000").unwrap();
 
     println!("File server listening on 0.0.0.0:9000");
 
@@ -28,7 +45,6 @@ fn main() {
 }
 
 fn handle_client(mut stream: std::net::TcpStream) {
-    // Receive the transfer header.
     let header = match receive_header(&mut stream) {
         Ok(header) => header,
         Err(error) => {
@@ -41,9 +57,11 @@ fn handle_client(mut stream: std::net::TcpStream) {
     println!("Filename: {}", header.filename);
     println!("File size: {} bytes", header.file_size);
 
-    // Validate the filename.
     if !is_safe_filename(&header.filename) {
-        println!("Rejected unsafe filename: {}", header.filename);
+        println!(
+            "Rejected unsafe filename: {}",
+            header.filename
+        );
         return;
     }
 
