@@ -7,36 +7,62 @@ use std::thread;
 use drop::discovery;
 use drop::pairing;
 use drop::protocol::receive_header;
+use drop::transfer_auth;
 
 fn main() {
-    // Create this device's identity.
-    let identity = discovery::load_or_create_device_identity();
-
-    // Generate a pairing code.
-    let pairing_code = pairing::generate_pairing_code();
-
-    // Start the pairing server.
-    thread::spawn(move || {
-        pairing::run_server(pairing_code);
-    });
+    let identity =
+        discovery::load_or_create_device_identity();
 
     println!("Starting Drop...");
-    println!("Device name: {}", identity.device_name);
-    println!("Device ID: {}", identity.device_id);
+    println!(
+        "Device name: {}",
+        identity.device_name
+    );
+    println!(
+        "Device ID: {}",
+        identity.device_id
+    );
 
-    // Start UDP discovery.
+    let pairing_code =
+        pairing::generate_pairing_code();
+
+    let signing_key =
+        identity.signing_key.clone();
+
+    thread::spawn(move || {
+        pairing::run_server(
+            pairing_code,
+            signing_key,
+        );
+    });
+
     thread::spawn(move || {
         discovery::run_server(identity);
     });
 
-    // Start TCP file transfer server.
     let listener =
-        TcpListener::bind("0.0.0.0:9000").unwrap();
+        TcpListener::bind(
+            "0.0.0.0:9000",
+        )
+        .unwrap();
 
-    println!("File server listening on 0.0.0.0:9000");
+    println!(
+        "File server listening on 0.0.0.0:9000"
+    );
 
     for stream in listener.incoming() {
-        let stream = stream.unwrap();
+        let stream = match stream {
+            Ok(stream) => stream,
+
+            Err(error) => {
+                println!(
+                    "Connection failed: {}",
+                    error
+                );
+
+                continue;
+            }
+        };
 
         thread::spawn(|| {
             handle_client(stream);
@@ -44,77 +70,168 @@ fn main() {
     }
 }
 
-fn handle_client(mut stream: std::net::TcpStream) {
-    let header = match receive_header(&mut stream) {
-        Ok(header) => header,
-        Err(error) => {
-            println!("Failed to receive header: {}", error);
-            return;
-        }
-    };
+fn handle_client(
+    mut stream: std::net::TcpStream,
+) {
+    /*
+     * Authenticate the device BEFORE
+     * accepting any file-transfer data.
+     */
+    if !transfer_auth::authenticate_client(
+        &mut stream,
+    ) {
+        println!(
+            "Unauthenticated transfer connection closed."
+        );
 
-    println!("Transfer ID: {}", header.transfer_id);
-    println!("Filename: {}", header.filename);
-    println!("File size: {} bytes", header.file_size);
+        return;
+    }
 
-    if !is_safe_filename(&header.filename) {
+    println!(
+        "Authenticated transfer connection accepted."
+    );
+
+    /*
+     * Only now do we read the file header.
+     */
+    let header =
+        match receive_header(&mut stream) {
+            Ok(header) => header,
+
+            Err(error) => {
+                println!(
+                    "Failed to receive header: {}",
+                    error
+                );
+
+                return;
+            }
+        };
+
+    println!(
+        "Incoming file: {}",
+        header.filename
+    );
+
+    println!(
+        "Expected size: {} bytes",
+        header.file_size
+    );
+
+    println!(
+        "Transfer ID: {}",
+        header.transfer_id
+    );
+
+    if !is_safe_filename(
+        &header.filename,
+    ) {
         println!(
             "Rejected unsafe filename: {}",
             header.filename
         );
+
         return;
     }
 
-    let temp_path = format!(
-        "received/{}_{}.part",
-        header.transfer_id,
-        header.filename
-    );
+    fs::create_dir_all("received")
+        .expect(
+            "Failed to create received directory",
+        );
 
-    let final_path = format!(
-        "received/{}_{}",
-        header.transfer_id,
-        header.filename
-    );
+    let temporary_path =
+        format!(
+            "received/{}_{}.part",
+            header.transfer_id,
+            header.filename
+        );
 
-    let mut file = match File::create(&temp_path) {
-        Ok(file) => file,
-        Err(error) => {
-            println!("Failed to create file: {}", error);
-            return;
-        }
-    };
+    let final_path =
+        format!(
+            "received/{}_{}",
+            header.transfer_id,
+            header.filename
+        );
 
-    let mut hasher = Sha256::new();
-
-    let mut buffer = [0u8; 1024];
-
-    let mut received = 0u64;
-
-    while received < header.file_size {
-        let bytes_read = match stream.read(&mut buffer) {
-            Ok(bytes) => bytes,
+    let mut file =
+        match File::create(
+            &temporary_path,
+        ) {
+            Ok(file) => file,
 
             Err(error) => {
                 println!(
-                    "Connection error during transfer: {}",
+                    "Failed to create temporary file: {}",
                     error
                 );
 
-                break;
+                return;
             }
         };
 
-        if bytes_read == 0 {
-            println!("Connection closed before transfer completed.");
+    let mut hasher =
+        Sha256::new();
+
+    let mut buffer =
+        [0u8; 1024];
+
+    let mut received =
+        0u64;
+
+    while received <
+        header.file_size
+    {
+        let remaining =
+            header.file_size - received;
+
+        let buffer_size =
+            remaining.min(
+                buffer.len() as u64
+            ) as usize;
+
+        let bytes_read =
+            match stream.read(
+                &mut buffer[..buffer_size],
+            ) {
+                Ok(0) => {
+                    println!(
+                        "Connection closed before transfer completed."
+                    );
+
+                    break;
+                }
+
+                Ok(bytes) => bytes,
+
+                Err(error) => {
+                    println!(
+                        "Connection error during transfer: {}",
+                        error
+                    );
+
+                    break;
+                }
+            };
+
+        if let Err(error) =
+            file.write_all(
+                &buffer[..bytes_read],
+            )
+        {
+            println!(
+                "Failed to write file: {}",
+                error
+            );
+
             break;
         }
 
-        file.write_all(&buffer[..bytes_read]).unwrap();
+        hasher.update(
+            &buffer[..bytes_read],
+        );
 
-        hasher.update(&buffer[..bytes_read]);
-
-        received += bytes_read as u64;
+        received +=
+            bytes_read as u64;
 
         println!(
             "Received {} / {} bytes",
@@ -123,46 +240,109 @@ fn handle_client(mut stream: std::net::TcpStream) {
         );
     }
 
-    file.flush().unwrap();
+    /*
+     * Make sure the temporary file is
+     * flushed before verification.
+     */
+    if let Err(error) =
+        file.flush()
+    {
+        println!(
+            "Failed to flush file: {}",
+            error
+        );
 
+        let _ =
+            fs::remove_file(
+                &temporary_path,
+            );
+
+        return;
+    }
+
+    /*
+     * The transfer must contain exactly
+     * the expected number of bytes.
+     */
     if received != header.file_size {
-        drop(file);
-
-        fs::remove_file(&temp_path).unwrap();
-
         println!(
             "Transfer incomplete: received {} / {} bytes",
             received,
             header.file_size
         );
 
-        println!("Incomplete file deleted.");
+        drop(file);
+
+        let _ =
+            fs::remove_file(
+                &temporary_path,
+            );
+
+        println!(
+            "Incomplete file deleted."
+        );
 
         return;
     }
 
-    let received_checksum = hasher.finalize();
+    let calculated_checksum =
+        hasher.finalize();
 
-    if received_checksum[..] != header.checksum[..] {
+    if calculated_checksum.as_slice()
+        != header.checksum
+    {
+        println!(
+            "Checksum mismatch!"
+        );
+
         drop(file);
 
-        fs::remove_file(&temp_path).unwrap();
+        let _ =
+            fs::remove_file(
+                &temporary_path,
+            );
 
-        println!("Checksum verification failed.");
-        println!("File was deleted.");
+        println!(
+            "Corrupt file deleted."
+        );
 
         return;
     }
 
     drop(file);
 
-    fs::rename(&temp_path, &final_path).unwrap();
+    if let Err(error) =
+        fs::rename(
+            &temporary_path,
+            &final_path,
+        )
+    {
+        println!(
+            "Failed to finalize file: {}",
+            error
+        );
 
-    println!("Checksum verified.");
-    println!("File saved as {}", final_path);
+        let _ =
+            fs::remove_file(
+                &temporary_path,
+            );
+
+        return;
+    }
+
+    println!(
+        "Transfer complete!"
+    );
+
+    println!(
+        "Saved to: {}",
+        final_path
+    );
 }
 
-fn is_safe_filename(filename: &str) -> bool {
+fn is_safe_filename(
+    filename: &str,
+) -> bool {
     if filename.is_empty() {
         return false;
     }

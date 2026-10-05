@@ -1,163 +1,357 @@
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, Write};
-use std::net::{TcpStream, UdpSocket};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::net::UdpSocket;
+use std::time::{
+    Duration,
+    SystemTime,
+    UNIX_EPOCH,
+};
 
-use drop::protocol::{send_header, TransferHeader};
+use drop::protocol::{
+    send_header,
+    TransferHeader,
+};
+use drop::transfer_auth;
 
 const DISCOVERY_PORT: u16 = 9001;
-const DISCOVERY_MESSAGE: &[u8] = b"DROP_DISCOVER";
+const DISCOVERY_MESSAGE: &[u8] =
+    b"DROP_DISCOVER";
 
 fn main() {
-    // --------------------------------------------------
-    // 1. Discover a Drop device
-    // --------------------------------------------------
-
-    let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-
-    socket.set_broadcast(true).unwrap();
-
-    socket
-        .set_read_timeout(Some(Duration::from_secs(3)))
+    /*
+     * Discover a Drop device.
+     */
+    let socket =
+        UdpSocket::bind(
+            "0.0.0.0:0",
+        )
         .unwrap();
 
-    let broadcast_address =
-        format!("255.255.255.255:{}", DISCOVERY_PORT);
-
     socket
-        .send_to(DISCOVERY_MESSAGE, broadcast_address)
+        .set_broadcast(true)
         .unwrap();
 
-    println!("Searching for Drop devices...");
+    socket
+        .set_read_timeout(
+            Some(Duration::from_secs(3)),
+        )
+        .unwrap();
 
-    let mut buffer = [0u8; 1024];
+    socket
+        .send_to(
+            DISCOVERY_MESSAGE,
+            format!(
+                "255.255.255.255:{}",
+                DISCOVERY_PORT
+            ),
+        )
+        .unwrap();
 
-    let (bytes_received, sender_address) =
-        socket.recv_from(&mut buffer).unwrap();
+    println!(
+        "Searching for Drop devices..."
+    );
 
-    let message =
-        String::from_utf8_lossy(&buffer[..bytes_received]);
+    let mut buffer =
+        [0u8; 1024];
 
-    println!("Found device at {}", sender_address.ip());
-    println!("Response: {}", message);
+    let (
+        device_ip,
+        device_port,
+        device_id,
+        device_name,
+    ) = loop {
+        match socket.recv_from(
+            &mut buffer,
+        ) {
+            Ok((
+                bytes_received,
+                sender_address,
+            )) => {
+                let message =
+                    String::from_utf8_lossy(
+                        &buffer[..bytes_received],
+                    );
 
-    // --------------------------------------------------
-    // 2. Parse the discovery response
-    // --------------------------------------------------
+                let parts:
+                    Vec<&str> =
+                    message
+                        .split('|')
+                        .collect();
 
-    let parts: Vec<&str> = message.split('|').collect();
+                if parts.len() == 4
+                    && parts[0]
+                        == "DROP_HERE"
+                {
+                    let device_id =
+                        parts[1];
 
-    if parts.len() != 3 || parts[0] != "DROP_HERE" {
-        println!("Invalid discovery response.");
+                    let device_name =
+                        parts[2];
+
+                    let port =
+                        match parts[3]
+                            .parse::<u16>()
+                        {
+                            Ok(port) =>
+                                port,
+
+                            Err(_) => {
+                                continue;
+                            }
+                        };
+
+                    break (
+                        sender_address.ip(),
+                        port,
+                        device_id.to_string(),
+                        device_name.to_string(),
+                    );
+                }
+            }
+
+            Err(error) => {
+                println!(
+                    "Discovery failed: {}",
+                    error
+                );
+
+                return;
+            }
+        }
+    };
+
+    println!(
+        "Found device: {}",
+        device_name
+    );
+
+    println!(
+        "Device ID: {}",
+        device_id
+    );
+
+    println!(
+        "Connecting to {}:{}...",
+        device_ip,
+        device_port
+    );
+
+    let mut stream =
+        match std::net::TcpStream::connect(
+            (
+                device_ip,
+                device_port,
+            ),
+        ) {
+            Ok(stream) => stream,
+
+            Err(error) => {
+                println!(
+                    "Connection failed: {}",
+                    error
+                );
+
+                return;
+            }
+        };
+
+    println!(
+        "Connected!"
+    );
+
+    /*
+     * Authenticate before sending
+     * any file-transfer data.
+     *
+     * IMPORTANT:
+     *
+     * This is currently the phone/test
+     * device's private key.
+     */
+    let signing_key =
+        load_phone_signing_key();
+
+    if !transfer_auth::send_authentication_request(
+        &mut stream,
+        &signing_key,
+    ) {
+        println!(
+            "Transfer authentication failed."
+        );
+
         return;
     }
 
-    let device_name = parts[1];
+    /*
+     * Open the file.
+     */
+    let filename =
+        "big.txt";
 
-    let transfer_port: u16 = match parts[2].parse() {
-        Ok(port) => port,
-        Err(_) => {
-            println!("Invalid transfer port.");
-            return;
-        }
-    };
+    let mut file =
+        match File::open(filename) {
+            Ok(file) => file,
 
-    println!("Device name: {}", device_name);
-    println!("Transfer port: {}", transfer_port);
+            Err(error) => {
+                println!(
+                    "Failed to open {}: {}",
+                    filename,
+                    error
+                );
 
-    // --------------------------------------------------
-    // 3. Connect to the discovered device
-    // --------------------------------------------------
+                return;
+            }
+        };
 
-    let server_address =
-        format!("{}:{}", sender_address.ip(), transfer_port);
+    let file_size =
+        match file.metadata() {
+            Ok(metadata) =>
+                metadata.len(),
 
-    println!("Connecting to {}...", server_address);
+            Err(error) => {
+                println!(
+                    "Failed to read file metadata: {}",
+                    error
+                );
 
-    let mut stream = TcpStream::connect(&server_address).unwrap();
+                return;
+            }
+        };
 
-    println!("Connected!");
+    println!(
+        "File: {}",
+        filename
+    );
 
-    // --------------------------------------------------
-    // 4. Open the file
-    // --------------------------------------------------
+    println!(
+        "File size: {} bytes",
+        file_size
+    );
 
-    let filename = "big.txt";
+    /*
+     * Calculate SHA-256.
+     */
+    let mut hasher =
+        Sha256::new();
 
-    let mut file = File::open(filename).unwrap();
-
-    let file_size = file.metadata().unwrap().len();
-
-    println!("File: {}", filename);
-    println!("File size: {} bytes", file_size);
-
-    // --------------------------------------------------
-    // 5. Calculate SHA-256 checksum
-    // --------------------------------------------------
-
-    let mut hasher = Sha256::new();
-
-    let mut buffer = [0u8; 1024];
+    let mut buffer =
+        [0u8; 1024];
 
     loop {
-        let bytes_read = file.read(&mut buffer).unwrap();
+        let bytes_read =
+            match file.read(
+                &mut buffer,
+            ) {
+                Ok(0) => break,
 
-        if bytes_read == 0 {
-            break;
-        }
+                Ok(bytes) => bytes,
 
-        hasher.update(&buffer[..bytes_read]);
+                Err(error) => {
+                    println!(
+                        "Failed to read file: {}",
+                        error
+                    );
+
+                    return;
+                }
+            };
+
+        hasher.update(
+            &buffer[..bytes_read],
+        );
     }
 
-    let checksum = hasher.finalize();
+    let checksum =
+        hasher.finalize();
 
-    println!("Checksum calculated.");
+    /*
+     * Rewind file so we can send it.
+     */
+    if let Err(error) =
+        file.rewind()
+    {
+        println!(
+            "Failed to rewind file: {}",
+            error
+        );
 
-    // Go back to the beginning.
-    file.rewind().unwrap();
+        return;
+    }
 
-    // --------------------------------------------------
-    // 6. Create transfer ID
-    // --------------------------------------------------
+    let transfer_id =
+        SystemTime::now()
+            .duration_since(
+                UNIX_EPOCH,
+            )
+            .unwrap()
+            .as_nanos() as u64;
 
-    let transfer_id = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
+    let header =
+        TransferHeader {
+            transfer_id,
+            filename:
+                filename.to_string(),
+            file_size,
+            checksum:
+                checksum.into(),
+        };
 
-    // --------------------------------------------------
-    // 7. Create and send transfer header
-    // --------------------------------------------------
+    if let Err(error) =
+        send_header(
+            &mut stream,
+            &header,
+        )
+    {
+        println!(
+            "Failed to send file header: {}",
+            error
+        );
 
-    let header = TransferHeader {
-        transfer_id,
-        filename: filename.to_string(),
-        file_size,
-        checksum: checksum.into(),
-    };
+        return;
+    }
 
-    send_header(&mut stream, &header).unwrap();
+    println!(
+        "Header sent!"
+    );
 
-    println!("Transfer ID: {}", transfer_id);
-    println!("Header sent!");
+    let mut sent =
+        0u64;
 
-    // --------------------------------------------------
-    // 8. Send file
-    // --------------------------------------------------
+    loop {
+        let bytes_read =
+            match file.read(
+                &mut buffer,
+            ) {
+                Ok(0) => break,
 
-    let mut sent = 0u64;
+                Ok(bytes) => bytes,
 
-    while sent < file_size {
-        let bytes_read = file.read(&mut buffer).unwrap();
+                Err(error) => {
+                    println!(
+                        "Failed to read file: {}",
+                        error
+                    );
 
-        if bytes_read == 0 {
-            break;
+                    return;
+                }
+            };
+
+        if let Err(error) =
+            stream.write_all(
+                &buffer[..bytes_read],
+            )
+        {
+            println!(
+                "Failed to send file: {}",
+                error
+            );
+
+            return;
         }
 
-        stream.write_all(&buffer[..bytes_read]).unwrap();
-
-        sent += bytes_read as u64;
+        sent +=
+            bytes_read as u64;
 
         println!(
             "Sent {} / {} bytes",
@@ -166,17 +360,31 @@ fn main() {
         );
     }
 
-    // --------------------------------------------------
-    // 9. Finish
-    // --------------------------------------------------
+    println!(
+        "Transfer complete!"
+    );
+}
 
-    if sent == file_size {
-        println!("Transfer complete!");
-    } else {
-        println!(
-            "Transfer incomplete: sent {} / {} bytes",
-            sent,
-            file_size
+fn load_phone_signing_key()
+    -> ed25519_dalek::SigningKey
+{
+    let key_bytes =
+        std::fs::read(
+            "phone_device_key.bin",
+        )
+        .expect(
+            "Failed to read phone device key",
         );
-    }
+
+    let key_array:
+        [u8; 32] =
+        key_bytes
+            .try_into()
+            .expect(
+                "Phone device key must contain exactly 32 bytes",
+            );
+
+    ed25519_dalek::SigningKey::from_bytes(
+        &key_array,
+    )
 }

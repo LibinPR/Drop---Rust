@@ -1,51 +1,83 @@
-use rand::Rng;
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 use std::fs;
 use std::net::UdpSocket;
 use std::path::Path;
 
 const DISCOVERY_PORT: u16 = 9001;
 const TRANSFER_PORT: u16 = 9000;
-
 const DISCOVERY_MESSAGE: &[u8] = b"DROP_DISCOVER";
-
-const DEVICE_ID_FILE: &str = "device_id.txt";
+const DEVICE_KEY_FILE: &str = "device_key.bin";
 
 pub struct DeviceIdentity {
     pub device_id: String,
     pub device_name: String,
+    pub signing_key: SigningKey,
 }
 
 pub fn load_or_create_device_identity() -> DeviceIdentity {
-    let device_id = if Path::new(DEVICE_ID_FILE).exists() {
-        println!("Loading existing device ID.");
+    if Path::new(DEVICE_KEY_FILE).exists() {
+        println!("Loading existing device key.");
 
-        fs::read_to_string(DEVICE_ID_FILE)
-            .unwrap()
-            .trim()
-            .to_string()
-    } else {
-        println!("Creating new device ID.");
+        let key_bytes =
+            fs::read(DEVICE_KEY_FILE)
+                .expect("Failed to read device key");
 
-        let mut rng = rand::rng();
+        let key_array: [u8; 32] = key_bytes
+            .try_into()
+            .expect("Device key must contain exactly 32 bytes");
 
-        let random_id: u128 = rng.random();
+        let signing_key =
+            SigningKey::from_bytes(&key_array);
 
-        let device_id = format!("{:032x}", random_id);
+        let device_id =
+            hex_device_id(&signing_key);
 
-        fs::write(DEVICE_ID_FILE, &device_id).unwrap();
+        return DeviceIdentity {
+            device_id,
+            device_name: "Libin-PC".to_string(),
+            signing_key,
+        };
+    }
 
-        device_id
-    };
+    println!("Creating new device key.");
+
+    let mut rng = OsRng;
+
+    let signing_key =
+        SigningKey::generate(&mut rng);
+
+    fs::write(
+        DEVICE_KEY_FILE,
+        signing_key.to_bytes(),
+    )
+    .expect("Failed to save device key");
+
+    let device_id =
+        hex_device_id(&signing_key);
 
     DeviceIdentity {
         device_id,
         device_name: "Libin-PC".to_string(),
+        signing_key,
     }
+}
+
+fn hex_device_id(signing_key: &SigningKey) -> String {
+    let public_key =
+        signing_key.verifying_key();
+
+    public_key
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
 }
 
 pub fn run_server(identity: DeviceIdentity) {
     let socket =
-        UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).unwrap();
+        UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))
+            .expect("Failed to bind discovery socket");
 
     println!(
         "Discovery server listening on UDP port {}",
@@ -59,9 +91,12 @@ pub fn run_server(identity: DeviceIdentity) {
 
     loop {
         let (bytes_received, sender_address) =
-            socket.recv_from(&mut buffer).unwrap();
+            socket
+                .recv_from(&mut buffer)
+                .expect("Failed to receive discovery request");
 
-        let message = &buffer[..bytes_received];
+        let message =
+            &buffer[..bytes_received];
 
         if message == DISCOVERY_MESSAGE {
             println!(
@@ -77,8 +112,11 @@ pub fn run_server(identity: DeviceIdentity) {
             );
 
             socket
-                .send_to(response.as_bytes(), sender_address)
-                .unwrap();
+                .send_to(
+                    response.as_bytes(),
+                    sender_address,
+                )
+                .expect("Failed to send discovery response");
 
             println!(
                 "Discovery response sent to {}",
