@@ -14,8 +14,7 @@ fn main() {
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
 
-    let broadcast_address =
-        format!("255.255.255.255:{}", DISCOVERY_PORT);
+    let broadcast_address = format!("255.255.255.255:{}", DISCOVERY_PORT);
 
     socket
         .send_to(DISCOVERY_MESSAGE, broadcast_address)
@@ -28,15 +27,11 @@ fn main() {
     loop {
         match socket.recv_from(&mut buffer) {
             Ok((bytes_received, sender_address)) => {
-                let message =
-                    String::from_utf8_lossy(&buffer[..bytes_received]);
+                let message = String::from_utf8_lossy(&buffer[..bytes_received]);
 
-                let parts: Vec<&str> =
-                    message.split('|').collect();
+                let parts: Vec<&str> = message.split('|').collect();
 
-                if parts.len() == 4
-                    && parts[0] == "DROP_HERE"
-                {
+                if parts.len() == 4 && parts[0] == "DROP_HERE" {
                     let device_id = parts[1];
                     let device_name = parts[2];
                     let transfer_port = parts[3];
@@ -44,14 +39,8 @@ fn main() {
                     println!("Found Drop device:");
                     println!("  Name: {}", device_name);
                     println!("  ID: {}", device_id);
-                    println!(
-                        "  IP: {}",
-                        sender_address.ip()
-                    );
-                    println!(
-                        "  Port: {}",
-                        transfer_port
-                    );
+                    println!("  IP: {}", sender_address.ip());
+                    println!("  Port: {}", transfer_port);
                     println!();
                 }
             }

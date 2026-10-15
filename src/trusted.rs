@@ -9,8 +9,7 @@ pub fn load_trusted_devices() -> Vec<String> {
     }
 
     let contents =
-        fs::read_to_string(TRUSTED_DEVICES_FILE)
-            .expect("Failed to read trusted devices");
+        fs::read_to_string(TRUSTED_DEVICES_FILE).expect("Failed to read trusted devices");
 
     contents
         .lines()
@@ -19,40 +18,24 @@ pub fn load_trusted_devices() -> Vec<String> {
         .collect()
 }
 
-pub fn is_trusted(
-    device_id: &str,
-) -> bool {
-    let devices =
-        load_trusted_devices();
+pub fn is_trusted(device_id: &str) -> bool {
+    let devices = load_trusted_devices();
 
-    devices
-        .iter()
-        .any(|id| id == device_id)
+    devices.iter().any(|id| id == device_id)
 }
 
-pub fn add_trusted_device(
-    device_id: &str,
-) {
+pub fn add_trusted_device(device_id: &str) {
     if is_trusted(device_id) {
         return;
     }
 
-    let mut devices =
-        load_trusted_devices();
+    let mut devices = load_trusted_devices();
 
     devices.push(device_id.to_string());
 
-    let contents =
-        devices.join("\n");
+    let contents = devices.join("\n");
 
-    fs::write(
-        TRUSTED_DEVICES_FILE,
-        contents,
-    )
-    .expect("Failed to save trusted device");
+    fs::write(TRUSTED_DEVICES_FILE, contents).expect("Failed to save trusted device");
 
-    println!(
-        "Trusted device saved: {}",
-        device_id
-    );
+    println!("Trusted device saved: {}", device_id);
 }

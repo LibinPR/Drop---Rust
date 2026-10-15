@@ -1,10 +1,10 @@
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{Read, Seek ,Write};
+use std::io::{Read, Seek, Write};
 use std::net::TcpStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use drop::protocol::{send_header, TransferHeader};
+use drop::protocol::{TransferHeader, send_header};
 
 fn main() {
     let filename = "big.txt";
@@ -79,9 +79,6 @@ fn main() {
     if sent == file_size {
         println!("File sent successfully!");
     } else {
-        println!(
-            "Transfer incomplete: sent {} / {} bytes",
-            sent, file_size
-        );
+        println!("Transfer incomplete: sent {} / {} bytes", sent, file_size);
     }
 }
