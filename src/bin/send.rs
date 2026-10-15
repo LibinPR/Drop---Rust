@@ -5,6 +5,10 @@ use std::io::{self, Read, Seek, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool , Ordering},
+};
 
 use drop::protocol::{TransferHeader, send_header};
 use drop::secure_channel;
@@ -62,6 +66,14 @@ fn main() {
 
     let mut expected_hasher = Sha256::new();
     let mut buffer = [0u8; CHUNK_SIZE];
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_flag = Arc::clone(&cancelled);
+
+    ctrlc::set_handler(move || {
+        cancel_flag.store(true, Ordering::SeqCst);
+    })
+    .expect("Failed to register Ctrl+C handler");
 
     loop {
         let bytes_read = match file.read(&mut buffer) {
@@ -193,6 +205,12 @@ fn main() {
     println!("Sending file...");
 
     loop {
+        if cancelled.load(Ordering::SeqCst) {
+            println!("\nTransfer cancelled. Closing connection...");
+            let _ = channel.shutdown();
+            std::process::exit(130);
+        }
+
         let bytes_read = match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(bytes) => bytes,

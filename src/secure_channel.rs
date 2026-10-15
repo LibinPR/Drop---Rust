@@ -208,6 +208,11 @@ impl SecureChannel {
     pub fn receive(&mut self) -> io::Result<Vec<u8>> {
         receive_encrypted(&mut self.stream, &mut self.transport)
     }
+
+    /// Shut down the TCP connection to stop an ongoing transfer.
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
+    }
 }
 
 /// Client side: verifies that the remote server owns the expected PC identity.
