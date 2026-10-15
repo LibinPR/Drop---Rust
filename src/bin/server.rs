@@ -10,12 +10,22 @@ use drop::pairing;
 use drop::protocol::receive_header;
 use drop::secure_channel::SecureChannel;
 
+const RECEIVED_DIR: &str = "received";
+const TEMP_DIR: &str = "received/.drop-temp";
+
 fn main() {
+    if let Err(error) = cleanup_abandoned_transfers() {
+        eprintln!("Could not clean up temporary transfers: {error}");
+        eprintln!("Drop will not start until this is resolved.");
+        return;
+    }
+
     let identity = discovery::load_or_create_device_identity();
 
     println!("Starting Drop...");
     println!("Device name: {}", identity.device_name);
     println!("Device ID: {}", identity.device_id);
+    println!("Abandoned temporary transfers cleaned up.");
 
     let server_signing_key = identity.signing_key.clone();
 
@@ -49,6 +59,33 @@ fn main() {
             }
         }
     }
+}
+
+// Temporary files are isolated from completed downloads.
+// At startup there cannot be any active transfers from a previous process.
+fn cleanup_abandoned_transfers() -> io::Result<()> {
+    fs::create_dir_all(RECEIVED_DIR)?;
+    fs::create_dir_all(TEMP_DIR)?;
+
+    for entry in fs::read_dir(TEMP_DIR)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+
+        // Only remove regular files. Leave unexpected directories or
+        // other filesystem entries untouched.
+        if file_type.is_file() {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => {
+                    println!("Removed abandoned temporary file: {}", entry.path().display());
+                }
+                Err(error) => {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
@@ -88,13 +125,16 @@ fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
     println!("Incoming file: {}", header.filename);
     println!("Expected size: {} bytes", header.file_size);
 
-    if let Err(error) = fs::create_dir_all("received") {
-        reject_transfer(&mut channel, "Could not create received directory");
-        println!("Failed to create received directory: {error}");
+    if let Err(error) = fs::create_dir_all(TEMP_DIR) {
+        reject_transfer(&mut channel, "Could not create temporary directory");
+        println!("Failed to create temporary directory: {error}");
         return;
     }
 
-    let temporary_path = format!("received/{}_{}.part", header.transfer_id, header.filename);
+    let temporary_path = Path::new(TEMP_DIR).join(format!(
+        "{}_{}.part",
+        header.transfer_id, header.filename
+    ));
 
     let mut file = match OpenOptions::new()
         .write(true)
@@ -126,9 +166,9 @@ fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
 
         let remaining = header.file_size - received;
 
-        if chunk.len() as u64 > remaining {
-            reject_transfer(&mut channel, "Received more data than expected");
-            println!("Rejected data exceeding the declared file size.");
+        if chunk.is_empty() || chunk.len() as u64 > remaining {
+            reject_transfer(&mut channel, "Invalid chunk size");
+            println!("Rejected empty or oversized data chunk.");
             drop(file);
             let _ = fs::remove_file(&temporary_path);
             return;
@@ -168,9 +208,9 @@ fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
 
     drop(file);
 
-    // Atomically claim an unused destination filename.
+    // Reserve a unique final name without overwriting an existing file.
     let (final_path, mut destination) =
-        match reserve_destination(Path::new("received"), &header.filename) {
+        match reserve_destination(Path::new(RECEIVED_DIR), &header.filename) {
             Ok(result) => result,
             Err(error) => {
                 reject_transfer(&mut channel, "Could not choose a destination filename");
@@ -180,8 +220,7 @@ fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
             }
         };
 
-    // Copy only after checksum verification. The destination was created
-    // exclusively, so an existing file will never be overwritten.
+    // Only finalize the file after its checksum has been verified.
     let copy_result = (|| -> io::Result<()> {
         let mut source = File::open(&temporary_path)?;
         io::copy(&mut source, &mut destination)?;

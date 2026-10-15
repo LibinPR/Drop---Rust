@@ -1,10 +1,10 @@
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::File;
-use std::io::{Read, Seek};
+use std::io::{self, Read, Seek, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use drop::protocol::{TransferHeader, send_header};
 use drop::secure_channel;
@@ -55,9 +55,11 @@ fn main() {
 
     println!("Selected file: {}", file_path.display());
     println!("Filename: {filename}");
-    println!("File size: {file_size} bytes");
+    println!("File size: {}", format_bytes(file_size));
 
     // First pass: calculate the expected checksum.
+    println!("Preparing file checksum...");
+
     let mut expected_hasher = Sha256::new();
     let mut buffer = [0u8; CHUNK_SIZE];
 
@@ -82,7 +84,8 @@ fn main() {
     }
 
     // Discover a Drop device.
-    let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to create discovery socket");
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .expect("Failed to create discovery socket");
 
     socket
         .set_broadcast(true)
@@ -144,13 +147,14 @@ fn main() {
 
     let signing_key = load_phone_signing_key();
 
-    let mut channel = match secure_channel::connect_client(stream, &signing_key, &device_id) {
-        Ok(channel) => channel,
-        Err(error) => {
-            eprintln!("Secure connection failed: {error}");
-            std::process::exit(1);
-        }
-    };
+    let mut channel =
+        match secure_channel::connect_client(stream, &signing_key, &device_id) {
+            Ok(channel) => channel,
+            Err(error) => {
+                eprintln!("Secure connection failed: {error}");
+                std::process::exit(1);
+            }
+        };
 
     println!("Secure connection established; both device identities verified.");
 
@@ -181,17 +185,20 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Second pass: hash exactly the bytes being sent.
+    // Second pass: hash and send exactly the bytes being transmitted.
     let mut sent_hasher = Sha256::new();
     let mut sent = 0u64;
+    let transfer_started = Instant::now();
+
+    println!("Sending file...");
 
     loop {
         let bytes_read = match file.read(&mut buffer) {
             Ok(0) => break,
             Ok(bytes) => bytes,
             Err(error) => {
-                eprintln!("Failed to read file while sending: {error}");
-                eprintln!("Stopping because the transfer may be incomplete.");
+                eprintln!("\nFailed to read file while sending: {error}");
+                eprintln!("The transfer may be incomplete.");
                 std::process::exit(1);
             }
         };
@@ -199,13 +206,18 @@ fn main() {
         sent_hasher.update(&buffer[..bytes_read]);
 
         if let Err(error) = channel.send(&buffer[..bytes_read]) {
-            eprintln!("Failed to send encrypted file data: {error}");
+            eprintln!("\nFailed to send encrypted file data: {error}");
             std::process::exit(1);
         }
 
         sent += bytes_read as u64;
-        println!("Sent {sent} / {file_size} bytes");
+
+        show_progress(sent, file_size, transfer_started);
     }
+
+    // Ensure even an empty file displays a completed progress line.
+    show_progress(sent, file_size, transfer_started);
+    println!();
 
     let sent_checksum = sent_hasher.finalize();
 
@@ -230,7 +242,9 @@ fn main() {
 
     match channel.receive() {
         Ok(response) if response == b"OK" => {
-            if sent_checksum.as_slice() == expected_checksum.as_slice() && sent == file_size {
+            if sent_checksum.as_slice() == expected_checksum.as_slice()
+                && sent == file_size
+            {
                 println!("SUCCESS: Receiver verified the checksum and saved the file.");
             } else {
                 eprintln!(
@@ -261,6 +275,76 @@ fn main() {
     }
 }
 
+fn show_progress(sent: u64, total: u64, started: Instant) {
+    let percent = if total == 0 {
+        100
+    } else {
+        ((sent as f64 / total as f64) * 100.0).round() as u64
+    };
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let speed = if elapsed > 0.0 {
+        sent as f64 / elapsed
+    } else {
+        0.0
+    };
+
+    let eta = if total <= sent {
+        "00:00".to_string()
+    } else if speed > 0.0 {
+        format_duration(((total - sent) as f64 / speed).ceil() as u64)
+    } else {
+        "--:--".to_string()
+    };
+
+    let bar_width = 24usize;
+    let filled = ((percent as usize * bar_width) / 100).min(bar_width);
+    let bar = format!(
+        "{}{}",
+        "#".repeat(filled),
+        "-".repeat(bar_width - filled)
+    );
+
+    print!(
+        "\r[{bar}] {percent:3}% | {} / {} | {} | ETA {eta}",
+        format_bytes(sent),
+        format_bytes(total),
+        format_bytes(speed as u64),
+    );
+
+    let _ = io::stdout().flush();
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
 fn get_file_path() -> Result<PathBuf, String> {
     let mut args = env::args_os();
     let _program = args.next();
@@ -276,7 +360,8 @@ fn get_file_path() -> Result<PathBuf, String> {
 }
 
 fn load_phone_signing_key() -> ed25519_dalek::SigningKey {
-    let key_bytes = std::fs::read("phone_device_key.bin").expect("Failed to read phone device key");
+    let key_bytes =
+        std::fs::read("phone_device_key.bin").expect("Failed to read phone device key");
 
     let key_array: [u8; 32] = key_bytes
         .try_into()
