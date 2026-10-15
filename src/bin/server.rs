@@ -251,7 +251,7 @@ fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
         hasher.update(&chunk);
         received += chunk.len() as u64;
 
-        println!("Received {} / {} bytes", received, header.file_size);
+        
     }
 
     if let Err(error) = file.flush() {

@@ -145,9 +145,17 @@ fn main() {
         }
     };
 
+
     println!("Found device: {device_name}");
     println!("Device ID: {device_id}");
+
+   if let Err(error) = verify_trusted_pc_id(&device_id) {
+        eprintln!("PC identity verification failed: {error}");
+        std::process::exit(1);
+    }
+
     println!("Connecting to {device_ip}:{device_port}...");
+
 
     let stream = match std::net::TcpStream::connect((device_ip, device_port)) {
         Ok(stream) => stream,
@@ -256,9 +264,6 @@ fn main() {
     }
 
 
-
-
-    // Second pass: hash and send exactly the bytes being transmitted.
     let mut sent = resume_offset;
     let transfer_started = Instant::now();
 
@@ -436,6 +441,37 @@ fn get_file_path() -> Result<PathBuf, String> {
         ),
     }
 }
+
+
+
+fn verify_trusted_pc_id(discovered_pc_id: &str) -> Result<(), String> {
+    use std::fs;
+    use std::path::Path;
+
+    const TRUSTED_PC_FILE: &str = "trusted_pc_id.txt";
+
+    if !Path::new(TRUSTED_PC_FILE).exists() {
+        return Err(
+            "No paired PC identity found. Run `cargo run --bin pair` first."
+                .to_string(),
+        );
+    }
+
+    let saved_pc_id = fs::read_to_string(TRUSTED_PC_FILE)
+        .map_err(|error| format!("Failed to read trusted PC ID: {error}"))?;
+
+    if saved_pc_id.trim() != discovered_pc_id {
+        return Err(format!(
+            "PC identity mismatch! Expected {}, but discovered {}. Refusing to connect.",
+            saved_pc_id.trim(),
+            discovered_pc_id
+        ));
+    }
+
+    Ok(())
+}
+
+
 
 fn load_phone_signing_key() -> ed25519_dalek::SigningKey {
     let key_bytes =

@@ -36,7 +36,15 @@ fn main() {
 
     println!("Connecting to pairing service...");
 
-    let mut stream = match TcpStream::connect("127.0.0.1:9002") {
+    println!("Enter the PC IP address (example: 192.168.1.10):");
+
+    let mut pc_ip = String::new();
+
+    io::stdin().read_line(&mut pc_ip).unwrap();
+
+    let pc_address = format!("{}:9002", pc_ip.trim());
+
+    let mut stream = match TcpStream::connect(&pc_address) {
         Ok(stream) => stream,
 
         Err(error) => {
@@ -244,18 +252,46 @@ fn main() {
         }
     };
 
-    if message_type == MESSAGE_TRUSTED {
-        println!("PC verified the phone identity.");
+    
+if message_type == MESSAGE_TRUSTED {
+    println!("PC verified the phone identity.");
+
+    let trusted_pc_file = "trusted_pc_id.txt";
+    let pc_id = public_key_hex_from_verifying_key(&pc_verifying_key);
+
+    if Path::new(trusted_pc_file).exists() {
+        let existing_id = match fs::read_to_string(trusted_pc_file) {
+            Ok(id) => id,
+            Err(error) => {
+                eprintln!("Failed to read existing trusted PC ID: {error}");
+                return;
+            }
+        };
+
+        if existing_id.trim() != pc_id {
+            eprintln!(
+                "Pairing refused: a different PC is already trusted ({}). \
+                Remove trusted_pc_id.txt manually if you intend to replace it.",
+                existing_id.trim()
+            );
+            return;
+        }
+        } else if let Err(error) = fs::write(trusted_pc_file, &pc_id) {
+            eprintln!("Failed to save trusted PC identity: {error}");
+            return;
+        }
+
+        println!("Trusted PC identity saved.");
 
         println!("Mutual authentication successful!");
-
         println!("Pairing completed successfully!");
     } else {
         println!(
             "PC did not trust the phone: {}",
-            String::from_utf8_lossy(&payload,)
+            String::from_utf8_lossy(&payload)
         );
     }
+
 }
 
 fn load_or_create_device_key() -> SigningKey {
@@ -290,3 +326,12 @@ fn public_key_hex(signing_key: &SigningKey) -> String {
         .map(|byte| format!("{:02x}", byte))
         .collect()
 }
+
+
+fn public_key_hex_from_verifying_key(key: &VerifyingKey) -> String {
+    key.as_bytes()
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
