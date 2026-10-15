@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -71,9 +71,9 @@ fn cleanup_abandoned_transfers() -> io::Result<()> {
         let entry = entry?;
         let file_type = entry.file_type()?;
 
-        // Only remove regular files. Leave unexpected directories or
-        // other filesystem entries untouched.
-        if file_type.is_file() {
+       if file_type.is_file()
+            && entry.path().extension().and_then(|ext| ext.to_str()) != Some("part")
+        {
             match fs::remove_file(entry.path()) {
                 Ok(()) => {
                     println!("Removed abandoned temporary file: {}", entry.path().display());
@@ -131,35 +131,101 @@ fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
         return;
     }
 
-    let temporary_path = Path::new(TEMP_DIR).join(format!(
-        "{}_{}.part",
-        header.transfer_id, header.filename
-    ));
+    
+    let checksum_name: String = header
+        .checksum
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
 
+    let temporary_path = Path::new(TEMP_DIR)
+        .join(format!("{}_{}.part", checksum_name, header.filename));
+
+    
     let mut file = match OpenOptions::new()
+        .read(true)
         .write(true)
-        .create_new(true)
+        .create(true)
         .open(&temporary_path)
     {
         Ok(file) => file,
         Err(error) => {
-            reject_transfer(&mut channel, "Could not create temporary file");
-            println!("Failed to create temporary file: {error}");
+            reject_transfer(&mut channel, "Could not open temporary file");
+            println!("Failed to open temporary file: {error}");
             return;
         }
     };
 
+    let mut received = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            reject_transfer(&mut channel, "Could not inspect temporary file");
+            println!("Failed to inspect temporary file: {error}");
+            return;
+        }
+    };
+
+    if received > header.file_size {
+        if let Err(error) = file.set_len(0) {
+            reject_transfer(&mut channel, "Could not reset temporary file");
+            println!("Failed to reset temporary file: {error}");
+            return;
+        }
+        received = 0;
+    }
+
     let mut hasher = Sha256::new();
-    let mut received = 0u64;
+    let mut prefix_remaining = received;
+    let mut buffer = [0u8; 32 * 1024];
+
+    if let Err(error) = file.seek(SeekFrom::Start(0)) {
+        reject_transfer(&mut channel, "Could not read temporary file");
+        println!("Failed to seek temporary file: {error}");
+        return;
+    }
+
+    while prefix_remaining > 0 {
+        let amount = prefix_remaining.min(buffer.len() as u64) as usize;
+        let bytes_read = match file.read(&mut buffer[..amount]) {
+            Ok(0) => {
+                reject_transfer(&mut channel, "Temporary file ended unexpectedly");
+                println!("Temporary file was shorter than expected.");
+                return;
+            }
+            Ok(count) => count,
+            Err(error) => {
+                reject_transfer(&mut channel, "Could not read temporary file");
+                println!("Failed to read temporary file: {error}");
+                return;
+            }
+        };
+
+        hasher.update(&buffer[..bytes_read]);
+        prefix_remaining -= bytes_read as u64;
+    }
+
+    if let Err(error) = file.seek(SeekFrom::End(0)) {
+        reject_transfer(&mut channel, "Could not seek temporary file");
+        println!("Failed to seek to end of temporary file: {error}");
+        return;
+    }
+
+    if let Err(error) = channel.send(&received.to_be_bytes()) {
+        println!("Could not send resume position: {error}");
+        return;
+    }
+
+    println!("Resuming at byte {received}.");
 
     while received < header.file_size {
         let chunk = match channel.receive() {
             Ok(chunk) => chunk,
-            Err(error) => {
-                println!("Encrypted transfer failed: {error}");
+            Err(_) => {
+                println!(
+                    "Transfer interrupted; keeping partial file for resume: {}",
+                    header.filename
+                );
                 drop(file);
-                let _ = fs::remove_file(&temporary_path);
-                reject_transfer(&mut channel, "Transfer interrupted");
                 return;
             }
         };

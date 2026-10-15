@@ -1,10 +1,10 @@
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs::File;
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::UdpSocket;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use std::sync::{
     Arc,
     atomic::{AtomicBool , Ordering},
@@ -170,13 +170,14 @@ fn main() {
 
     println!("Secure connection established; both device identities verified.");
 
-    let transfer_id = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos() as u64,
-        Err(error) => {
-            eprintln!("System clock error: {error}");
-            std::process::exit(1);
-        }
-    };
+    
+    let checksum_bytes = expected_checksum.as_slice();
+    let transfer_id = u64::from_be_bytes(
+        checksum_bytes[..8]
+            .try_into()
+            .expect("SHA-256 checksum must contain at least 8 bytes"),
+    );
+
 
     let header = TransferHeader {
         transfer_id,
@@ -192,14 +193,73 @@ fn main() {
         std::process::exit(1);
     }
 
-    if let Err(error) = channel.send(&header_bytes) {
-        eprintln!("Failed to send encrypted header: {error}");
+        if let Err(error) = channel.send(&header_bytes) {
+            eprintln!("Failed to send encrypted header: {error}");
+            std::process::exit(1);
+        }
+    
+    let resume_response = match channel.receive() {
+        Ok(response) if response.len() == 8 => response,
+        Ok(_) => {
+            eprintln!("Receiver returned an invalid resume offset.");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("Could not negotiate resume position: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    let resume_offset = u64::from_be_bytes(
+        resume_response
+            .as_slice()
+            .try_into()
+            .expect("Resume offset must contain 8 bytes"),
+    );
+
+    if resume_offset > file_size {
+        eprintln!("Receiver's resume offset exceeds the source file size.");
         std::process::exit(1);
     }
 
-    // Second pass: hash and send exactly the bytes being transmitted.
+    println!("Resuming from {} of {}.", format_bytes(resume_offset), format_bytes(file_size));
+
+    if let Err(error) = file.rewind() {
+        eprintln!("Failed to rewind source file: {error}");
+        std::process::exit(1);
+    }
+
     let mut sent_hasher = Sha256::new();
-    let mut sent = 0u64;
+    let mut prefix_remaining = resume_offset;
+
+    while prefix_remaining > 0 {
+        let amount = prefix_remaining.min(buffer.len() as u64) as usize;
+        let bytes_read = match file.read(&mut buffer[..amount]) {
+            Ok(0) => {
+                eprintln!("Source file ended before the resume offset.");
+                std::process::exit(1);
+            }
+            Ok(count) => count,
+            Err(error) => {
+                eprintln!("Could not verify the resumed prefix: {error}");
+                std::process::exit(1);
+            }
+        };
+
+        sent_hasher.update(&buffer[..bytes_read]);
+        prefix_remaining -= bytes_read as u64;
+    }
+
+    if let Err(error) = file.seek(SeekFrom::Start(resume_offset)) {
+        eprintln!("Could not seek to resume position: {error}");
+        std::process::exit(1);
+    }
+
+
+
+
+    // Second pass: hash and send exactly the bytes being transmitted.
+    let mut sent = resume_offset;
     let transfer_started = Instant::now();
 
     println!("Sending file...");
