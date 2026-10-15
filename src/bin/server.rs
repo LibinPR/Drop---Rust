@@ -1,7 +1,8 @@
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{Cursor, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Cursor, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use drop::discovery;
@@ -29,8 +30,8 @@ fn main() {
         discovery::run_server(identity);
     });
 
-    let listener = TcpListener::bind("0.0.0.0:9000")
-        .expect("Failed to bind file-transfer port 9000");
+    let listener =
+        TcpListener::bind("0.0.0.0:9000").expect("Failed to bind file-transfer port 9000");
 
     println!("Encrypted file server listening on port 9000");
 
@@ -93,19 +94,16 @@ fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
         return;
     }
 
-    let temporary_path = format!(
-        "received/{}_{}.part",
-        header.transfer_id, header.filename
-    );
-    let final_path = format!(
-        "received/{}_{}",
-        header.transfer_id, header.filename
-    );
+    let temporary_path = format!("received/{}_{}.part", header.transfer_id, header.filename);
 
-    let mut file = match File::create(&temporary_path) {
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_path)
+    {
         Ok(file) => file,
         Err(error) => {
-            reject_transfer(&mut channel, "Could not create destination file");
+            reject_transfer(&mut channel, "Could not create temporary file");
             println!("Failed to create temporary file: {error}");
             return;
         }
@@ -121,7 +119,6 @@ fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
                 println!("Encrypted transfer failed: {error}");
                 drop(file);
                 let _ = fs::remove_file(&temporary_path);
-                // The connection may be broken, so an acknowledgement may fail.
                 reject_transfer(&mut channel, "Transfer interrupted");
                 return;
             }
@@ -171,25 +168,87 @@ fn handle_client(stream: TcpStream, signing_key: ed25519_dalek::SigningKey) {
 
     drop(file);
 
-    if let Err(error) = fs::rename(&temporary_path, &final_path) {
-        reject_transfer(&mut channel, "Could not finalize the received file");
-        println!("Failed to finalize file: {error}");
+    // Atomically claim an unused destination filename.
+    let (final_path, mut destination) =
+        match reserve_destination(Path::new("received"), &header.filename) {
+            Ok(result) => result,
+            Err(error) => {
+                reject_transfer(&mut channel, "Could not choose a destination filename");
+                println!("Failed to reserve destination filename: {error}");
+                let _ = fs::remove_file(&temporary_path);
+                return;
+            }
+        };
+
+    // Copy only after checksum verification. The destination was created
+    // exclusively, so an existing file will never be overwritten.
+    let copy_result = (|| -> io::Result<()> {
+        let mut source = File::open(&temporary_path)?;
+        io::copy(&mut source, &mut destination)?;
+        destination.flush()?;
+        Ok(())
+    })();
+
+    if let Err(error) = copy_result {
+        println!("Failed to finalize received file: {error}");
+        drop(destination);
+        let _ = fs::remove_file(&final_path);
         let _ = fs::remove_file(&temporary_path);
+        reject_transfer(&mut channel, "Could not finalize the received file");
         return;
     }
 
-    // Send success only after checksum verification and final file rename.
+    drop(destination);
+
+    if let Err(error) = fs::remove_file(&temporary_path) {
+        println!("Warning: could not remove temporary file: {error}");
+    }
+
     match channel.send(b"OK") {
         Ok(()) => {
             println!("Transfer complete! Checksum verified.");
-            println!("Saved to: {final_path}");
+            println!("Saved to: {}", final_path.display());
             println!("Success acknowledgement sent to sender.");
         }
         Err(error) => {
             println!("File saved, but acknowledgement failed: {error}");
-            println!("Saved to: {final_path}");
+            println!("Saved to: {}", final_path.display());
         }
     }
+}
+
+fn reserve_destination(directory: &Path, filename: &str) -> io::Result<(PathBuf, File)> {
+    let original_path = Path::new(filename);
+    let stem = original_path
+        .file_stem()
+        .and_then(|part| part.to_str())
+        .unwrap_or("received-file");
+    let extension = original_path.extension().and_then(|part| part.to_str());
+
+    for index in 0u32.. {
+        let candidate_name = if index == 0 {
+            filename.to_string()
+        } else {
+            match extension {
+                Some(extension) => format!("{stem} ({index}).{extension}"),
+                None => format!("{stem} ({index})"),
+            }
+        };
+
+        let candidate_path = directory.join(candidate_name);
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate_path)
+        {
+            Ok(file) => return Ok((candidate_path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("The filename search range is finite")
 }
 
 fn reject_transfer(channel: &mut SecureChannel, reason: &str) {
